@@ -1,0 +1,67 @@
+import tensorflow as tf
+from tensorflow.keras import Model, Input
+from tensorflow.keras.layers import Dense, Dropout, Concatenate
+from spektral.layers import GCNConv
+
+def create_pure_gnn_link_prediction(
+    node_features_dim,
+    hidden_dim=32
+):
+    """
+    纯GNN链接预测模型：
+    - 不使用KGE风格的评分函数
+    - 直接用MLP预测边的存在概率
+    """
+    # 节点特征输入
+    node_features_input = Input(shape=(node_features_dim,), name="node_features_input")
+    
+    # 图结构输入
+    adj_input = Input(shape=(None,), sparse=True, name="adj_input")
+    
+    # 需要预测的边的端点索引
+    source_indices = Input(shape=(), dtype=tf.int32, name="source_indices")
+    target_indices = Input(shape=(), dtype=tf.int32, name="target_indices")
+    
+    # GNN层
+    x0 = Dense(hidden_dim, activation='relu')(node_features_input)
+    
+    # 第一层GCN
+    x1 = GCNConv(hidden_dim, activation='relu')([x0, adj_input])
+    x1 = Dropout(0.3)(x1)
+    
+    # 第二层GCN
+    x2 = GCNConv(hidden_dim, activation='relu')([x1, adj_input])
+    x2 = Dropout(0.3)(x2)
+    
+    # 最终节点嵌入
+    node_embeddings = Dense(hidden_dim, activation='relu')(x2)
+    
+    # 获取要预测边的两个节点的嵌入
+    source_embeddings = tf.gather(node_embeddings, source_indices)
+    target_embeddings = tf.gather(node_embeddings, target_indices)
+    
+    # 连接两个节点的嵌入
+    edge_features = Concatenate()([source_embeddings, target_embeddings])
+    
+    # 使用MLP进行边预测
+    x = Dense(hidden_dim, activation='relu')(edge_features)
+    x = Dropout(0.2)(x)
+    x = Dense(hidden_dim // 2, activation='relu')(x)
+    output = Dense(1, activation='sigmoid')(x)
+    output = tf.squeeze(output, axis=-1)
+    
+    # 创建模型
+    prediction_model = Model(
+        inputs=[node_features_input, adj_input, source_indices, target_indices],
+        outputs=output,
+        name="GNN_LinkPrediction"
+    )
+    
+    # 嵌入模型
+    embedding_model = Model(
+        inputs=[node_features_input, adj_input],
+        outputs=node_embeddings,
+        name="GNN_Embedding"
+    )
+    
+    return prediction_model, embedding_model
