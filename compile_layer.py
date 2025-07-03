@@ -41,7 +41,7 @@ def compile_and_organize():
         
         # 2. 用 EdgeTPU 编译器编译
         try:
-            subprocess.run([
+            result = subprocess.run([
                 "edgetpu_compiler", "-s", model_path
             ], capture_output=True, text=True, check=True)
             
