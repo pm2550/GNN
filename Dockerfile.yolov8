@@ -1,0 +1,55 @@
+FROM tensorflow/tensorflow:2.10.0-gpu
+
+# 设置工作目录
+WORKDIR /workplace
+
+# 更新系统并安装基础依赖
+RUN apt-get update && apt-get install -y \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    git \
+    libjemalloc-dev \
+    libjemalloc2 \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# 设置环境变量
+ENV CUDA_VISIBLE_DEVICES=""
+ENV MALLOC_CHECK_=0
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+
+# 升级pip
+RUN pip install --upgrade pip
+
+# 安装Python依赖 - 按兼容性顺序安装
+RUN pip install protobuf==3.20.3
+
+# 安装ONNX相关库
+RUN pip install \
+    onnx \
+    onnx-tf \
+    tf2onnx \
+    onnx2tf \
+    onnxconverter-common \
+    onnxoptimizer \
+    sng4onnx \
+    onnx-graphsurgeon \
+    tensorflow-probability
+
+# 安装ultralytics（降级到稳定版本）
+RUN pip install ultralytics==8.2.0
+
+# 下载EdgeTPU编译器
+RUN wget https://github.com/google-coral/edgetpu/releases/download/release-chef/edgetpu_compiler_linux_x86_64.tar.gz \
+    && tar -xzf edgetpu_compiler_linux_x86_64.tar.gz \
+    && mv edgetpu_compiler /usr/local/bin/ \
+    && rm edgetpu_compiler_linux_x86_64.tar.gz
+
+# 设置PATH
+ENV PATH="/usr/local/bin:${PATH}"
+
+# 创建models目录
+RUN mkdir -p /workplace/models
+
+# 设置默认命令
+CMD ["/bin/bash"] 

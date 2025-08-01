@@ -1,7 +1,7 @@
 """
-生成“加重量级”版本的典型层 TFLite 模型（浮点 + 全 INT8）
+生成适合Edge TPU的轻量级层模型（感知检测类工作负载）
 依赖：pip install tensorflow==2.15 numpy
-Edge TPU 每片片上约 8 MiB 权重缓存，请勿无限增大；以下配置已验证可正常编译。
+Edge TPU 优化：小模型、低通道数、适合移动端推理
 """
 
 import os, numpy as np, tensorflow as tf
@@ -16,51 +16,74 @@ def rep_dataset(shape):
             yield [np.random.rand(*shape).astype("float32")]
     return gen
 
-# ===================== 各层“重载”配置 ===============================
+# ===================== Edge TPU友好的轻量级配置 ===============================
 configs = {
-    # Conv2D：3 × 重复，输入通道 32 → 64 → 128，卷积核 3×3
-    "conv2d_heavy": {
-        "input_shape": (1, 224, 224, 32),
+    # Conv2D：MobileNet风格，轻量级卷积
+    "conv2d_light": {
+        "input_shape": (1, 224, 224, 3),
         "build": lambda inp: tf.keras.Sequential([
-            tf.keras.layers.Conv2D(64, 3, padding="same", activation=None),
-            tf.keras.layers.Conv2D(128, 3, padding="same", activation=None),
-            tf.keras.layers.Conv2D(128, 3, padding="same", activation=None),
+            tf.keras.layers.Conv2D(32, 3, strides=2, padding="same", activation="relu6"),
+            tf.keras.layers.Conv2D(64, 1, padding="same", activation="relu6"),
+            tf.keras.layers.Conv2D(64, 3, padding="same", activation="relu6"),
         ])(inp)
     },
-    # DepthwiseConv2D：5 × 重复，通道 64
-    "depthwise_conv2d_heavy": {
-        "input_shape": (1, 224, 224, 64),
+    # DepthwiseConv2D：MobileNet核心层
+    "depthwise_conv2d_light": {
+        "input_shape": (1, 112, 112, 32),
         "build": lambda inp: tf.keras.Sequential([
-            tf.keras.layers.DepthwiseConv2D(3, padding="same") for _ in range(5)
+            tf.keras.layers.DepthwiseConv2D(3, padding="same", activation="relu6"),
+            tf.keras.layers.Conv2D(64, 1, padding="same", activation="relu6"),
+            tf.keras.layers.DepthwiseConv2D(3, padding="same", activation="relu6"),
         ])(inp)
     },
-    # MaxPool：在高分辨率输入上连做 5 次 2×2 pool
-    "max_pool_heavy": {
-        "input_shape": (1, 512, 512, 16),
+    # MaxPool：典型特征提取
+    "max_pool_light": {
+        "input_shape": (1, 56, 56, 64),
         "build": lambda inp: tf.keras.Sequential([
-            tf.keras.layers.MaxPooling2D(2) for _ in range(5)
+            tf.keras.layers.MaxPooling2D(2, strides=2),
+            tf.keras.layers.MaxPooling2D(2, strides=2),
         ])(inp)
     },
-    # AvgPool：同上
-    "avg_pool_heavy": {
-        "input_shape": (1, 512, 512, 16),
+    # AvgPool：固定大小的平均池化（Edge TPU兼容）
+    "avg_pool_light": {
+        "input_shape": (1, 56, 56, 64),
         "build": lambda inp: tf.keras.Sequential([
-            tf.keras.layers.AveragePooling2D(2) for _ in range(5)
+            tf.keras.layers.AveragePooling2D(2, strides=2),
+            tf.keras.layers.AveragePooling2D(2, strides=2),
+            tf.keras.layers.AveragePooling2D(2, strides=2),
         ])(inp)
     },
-    # Dense：输入 1×1024，两个全连接 2048→2048
-    "dense_heavy": {
-        "input_shape": (1, 1024),
+    # Dense：轻量级分类头
+    "dense_light": {
+        "input_shape": (1, 128),
         "build": lambda inp: tf.keras.Sequential([
-            tf.keras.layers.Dense(2048, activation=None),
-            tf.keras.layers.Dense(2048, activation=None),
+            tf.keras.layers.Dense(256, activation="relu6"),
+            tf.keras.layers.Dense(1000, activation=None),  # ImageNet分类数
         ])(inp)
     },
-    # ReLU：对 1×256×256×128 激活张量做 10 次 ReLU
-    "relu_heavy": {
-        "input_shape": (1, 256, 256, 128),
+    # SeparableConv：Xception风格可分离卷积
+    "separable_conv_light": {
+        "input_shape": (1, 112, 112, 32),
         "build": lambda inp: tf.keras.Sequential([
-            tf.keras.layers.ReLU() for _ in range(10)
+            tf.keras.layers.SeparableConv2D(64, 3, padding="same", activation="relu6"),
+            tf.keras.layers.SeparableConv2D(128, 3, padding="same", activation="relu6"),
+        ])(inp)
+    },
+    # Detection head：目标检测常用的预测头
+    "detection_head": {
+        "input_shape": (1, 19, 19, 512),
+        "build": lambda inp: tf.keras.Sequential([
+            tf.keras.layers.Conv2D(256, 3, padding="same", activation="relu6"),
+            tf.keras.layers.Conv2D(84, 1, padding="same", activation=None),  # 21类×4坐标
+        ])(inp)
+    },
+    # Feature pyramid：多尺度特征融合
+    "feature_pyramid": {
+        "input_shape": (1, 38, 38, 256),
+        "build": lambda inp: tf.keras.Sequential([
+            tf.keras.layers.Conv2D(128, 1, padding="same", activation="relu6"),
+            tf.keras.layers.UpSampling2D(2),
+            tf.keras.layers.Conv2D(64, 3, padding="same", activation="relu6"),
         ])(inp)
     },
 }
@@ -79,14 +102,21 @@ def export(model, name, shape, quantize=False):
     path = os.path.join(SAVE_DIR, name + suffix)
     with open(path, "wb") as f:
         f.write(tflm)
-    print("Saved", path)
+    print("Saved", path, f"({len(tflm)/1024:.1f} KB)")
 
 # ===================== 主流程 ===============================
 def main():
+    print("生成Edge TPU友好的轻量级模型...")
     for name, cfg in configs.items():
+        print(f"\n生成 {name}:")
         inp = tf.keras.Input(shape=cfg["input_shape"][1:])
         out = cfg["build"](inp)
         model = tf.keras.Model(inp, out)
+        
+        # 显示模型信息
+        total_params = model.count_params()
+        print(f"  参数量: {total_params:,}")
+        
         export(model, name, cfg["input_shape"], quantize=False)
         export(model, name, cfg["input_shape"], quantize=True)
 
