@@ -149,6 +149,76 @@ def greedy_with_backtrack(model):
     seg_idx = 1
     remaining_mb = full_mb
 
+    # 统一的当前段逆向回退并即刻固化
+    def backtrack_current_and_finalize(cur_prev_idx, cur_end_idx, cur_seg_idx, segments_left, remaining_mb_local):
+        m_in_local = tensors[0] if cur_prev_idx < 0 else tensors[cur_prev_idx + 1]
+        for j in range(cur_end_idx - 1, cur_prev_idx, -1):
+            name_j = cands[j].name
+            mb_j = probe_size(m_in_local, tensors[j + 1], f'bt_seg{cur_seg_idx}_{name_j}')
+            if mb_j is None:
+                continue
+            if LOW <= mb_j <= HIGH:
+                # 可用性护栏：回退命中窗内后，需确保后续还能形成 n-1 合规段（末段连OUTPUT）
+                rem_after = remaining_mb_local - mb_j
+                seg_left_after = segments_left - 1
+                # 检查下一个段是否仍有>LOW窗内候选，且末段可连OUTPUT>LOW
+                def _availability_ok_after_pick_simple(i_pick, mb_pick, seg_idx_now, rem_after_pick, seg_left_now):
+                    if seg_left_now <= 1:
+                        return True
+                    # 估一估下一段
+                    prev_idx_next = i_pick
+                    m_in_next = tensors[0] if prev_idx_next < 0 else tensors[prev_idx_next + 1]
+                    # 简化探测：顺序向后，遇>HIGH早停，收集>LOW窗内
+                    inwin = []
+                    for k2 in range(prev_idx_next + 1, len(cands)):
+                        name2 = cands[k2].name
+                        mb2 = probe_size(m_in_next, tensors[k2 + 1], f'avail_seg{seg_idx_now+1}_{name2}')
+                        if mb2 is None:
+                            continue
+                        if mb2 > HIGH:
+                            break
+                        if mb2 > LOW:
+                            inwin.append((k2, name2, mb2))
+                    if not inwin:
+                        return False
+                    if seg_left_now == 2:
+                        # seg7 有>LOW窗内 + seg8(OUTPUT) > LOW 即可
+                        for (k2, nm2, mb2) in inwin:
+                            m_in_last = tensors[k2 + 1]
+                            mb8 = probe_size(m_in_last, tensors[-1], 'avail_last')
+                            if mb8 is not None and mb8 > LOW:
+                                return True
+                        return False
+                    # seg_left_now>=3：只要下一段能取>LOW窗内，递归近似通过
+                    return True
+                if not _availability_ok_after_pick_simple(j, mb_j, cur_seg_idx, rem_after, seg_left_after):
+                    continue
+                mb_bt, ok_bt = finalize_segment(m_in_local, tensors[j + 1], cur_seg_idx)
+                if ok_bt and LOW <= mb_bt <= HIGH:
+                    print(f'  回退固化: seg{cur_seg_idx} -> {name_j} = {mb_bt:.2f}MB')
+                    return j, name_j, mb_bt
+        return None
+
+    # 让上一段“向前（更早）”移动，为当前段腾出空间（应对全<LOW）
+    def shift_previous_backward_to_give_space(prev_seg_k):
+        if prev_seg_k < 1:
+            return None
+        prev_prev_idx = decisions[prev_seg_k - 2][0] if prev_seg_k - 2 >= 0 else -1
+        cur_idx = decisions[prev_seg_k - 1][0]
+        m_in_prev = tensors[0] if prev_prev_idx < 0 else tensors[prev_prev_idx + 1]
+        for j in range(cur_idx - 1, prev_prev_idx, -1):
+            name_j = cands[j].name
+            mb_j = probe_size(m_in_prev, tensors[j + 1], f'shift_prev_back_seg{prev_seg_k}_{name_j}')
+            if mb_j is None:
+                continue
+            if LOW <= mb_j <= HIGH:
+                mb_fix, ok_fix = finalize_segment(m_in_prev, tensors[j + 1], prev_seg_k)
+                if ok_fix and LOW <= mb_fix <= HIGH:
+                    decisions[prev_seg_k - 1] = (j, mb_fix)
+                    print(f'  回退：seg{prev_seg_k} 前移(更早)到 {name_j} = {mb_fix:.2f}MB')
+                    return j, mb_fix
+        return None
+
     while seg_idx <= SEGMENTS:
         segments_left = SEGMENTS - len(decisions)
         # 尾段：直接到输出，若超界触发回退机制2
@@ -188,7 +258,7 @@ def greedy_with_backtrack(model):
             print('无可探测候选')
             sys.exit(4)
 
-        # 选择最接近目标的候选，并按回退/前进找第一个合规（2-6MiB）
+        # 选择最接近目标的候选，并按回退/前进找第一个合规（LOW-HIGH）
         probes_sorted = sorted(probes, key=lambda x: abs(x[2] - target))
         ideal_i = probes.index(probes_sorted[0])
 
@@ -205,43 +275,114 @@ def greedy_with_backtrack(model):
                     pick = (i, name, mb)
                     break
 
-        # 若当前段最小候选仍 > HIGH，触发回退机制2：回退上一刀向后移，缩小当前跨度
+        # 若当前段最小候选仍 > HIGH，优先对“当前段”逆向回退并即刻固化；失败再启用旧的回退机制2
         min_mb = min(x[2] for x in probes)
         if pick is None and min_mb > HIGH:
-            print(f'第{seg_idx}段 min={min_mb:.2f}MB > 6MiB，启动回退机制2')
-            ret_ok = False
-            k = len(decisions) - 1
-            while k >= 0 and not ret_ok:
-                moved = try_shift_previous_to_absorb(k, decisions)
-                if moved:
+            print(f'第{seg_idx}段 min={min_mb:.2f}MB > {HIGH}MiB，当前段逆向回退')
+            bt = backtrack_current_and_finalize(prev_idx, probes[0][0], seg_idx, segments_left, remaining_mb)
+            if bt is not None:
+                i, name, mb_fix = bt
+                prev_idx = i
+                remaining_mb -= mb_fix
+                print(f'seg{seg_idx}: {name} = {mb_fix:.2f}MB ✓ (回退)')
+                log_write(f'Finalize seg{seg_idx}: {name} = {mb_fix:.2f}MB (bt)\n' + '-' * 60 + '\n')
+                seg_idx += 1
+                continue
+            print(f'第{seg_idx}段回退未命中，级联回退上一段向更早切点')
+            k = len(decisions)  # 上一段编号
+            success = False
+            while k >= 1:
+                moved = shift_previous_backward_to_give_space(k)
+                if moved is not None:
                     prev_idx = decisions[-1][0]
-                    probes = probe_from(prev_idx, seg_idx, target)
+                    # 重新探测当前段并固化
+                    target = remaining_mb / (SEGMENTS - len(decisions))
+                    probes = []
+                    m_in = tensors[0] if prev_idx < 0 else tensors[prev_idx + 1]
+                    for i2 in range(prev_idx + 1, len(cands)):
+                        name2 = cands[i2].name
+                        mb2 = probe_size(m_in, tensors[i2 + 1], f'seg{seg_idx}_{name2}')
+                        if mb2 is None:
+                            continue
+                        if mb2 > HIGH:
+                            break
+                        if mb2 > LOW:
+                            probes.append((i2, name2, mb2))
                     if probes:
                         probes_sorted = sorted(probes, key=lambda x: abs(x[2] - target))
-                        ideal_i = 0
-                        pick = None
-                        for p in range(ideal_i, -1, -1):
-                            i, name, mb = probes[p]
-                            if LOW <= mb <= HIGH:
-                                pick = (i, name, mb)
-                                break
-                        if pick is None:
-                            for p in range(ideal_i + 1, len(probes)):
-                                i, name, mb = probes[p]
-                                if LOW <= mb <= HIGH:
-                                    pick = (i, name, mb)
-                                    break
-                        if pick is not None:
-                            ret_ok = True
+                        i, name, mb = probes_sorted[0]
+                        mb_fix, ok2 = finalize_segment(m_in, tensors[i + 1], seg_idx)
+                        if ok2 and LOW <= mb_fix <= HIGH:
+                            prev_idx = i
+                            remaining_mb -= mb_fix
+                            print(f'seg{seg_idx}: {name} = {mb_fix:.2f}MB ✓ (回退)')
+                            log_write(f'Finalize seg{seg_idx}: {name} = {mb_fix:.2f}MB (bt)\n' + '-' * 60 + '\n')
+                            seg_idx += 1
+                            success = True
                             break
-                else:
-                    k -= 1
-            if not ret_ok:
-                print('回退机制2失败，无法吃下溢出')
-                sys.exit(5)
+                k -= 1
+            if success:
+                continue
+            print('级联回退失败，无法吃下溢出')
+            sys.exit(5)
+
+        # 若所有候选都 < LOW：让上一段向“更早”回退为当前段腾空间
+        all_small = all(mb < LOW for (_i, _n, mb) in probes) if probes else False
+        if pick is None and all_small:
+            print(f'第{seg_idx}段候选全<LOW，回退上一段向更早切点')
+            # 从紧邻上一段开始逐段向前尝试回退
+            k = len(decisions)
+            success = False
+            while k >= 1:
+                moved = shift_previous_backward_to_give_space(k)
+                if moved is not None:
+                    # 更新 prev_idx 并重新探测当前段
+                    prev_idx = decisions[-1][0]
+                    target = remaining_mb / (SEGMENTS - len(decisions))
+                    probes = []
+                    m_in = tensors[0] if prev_idx < 0 else tensors[prev_idx + 1]
+                    for i2 in range(prev_idx + 1, len(cands)):
+                        name2 = cands[i2].name
+                        mb2 = probe_size(m_in, tensors[i2 + 1], f'seg{seg_idx}_{name2}')
+                        if mb2 is None:
+                            continue
+                        if mb2 > HIGH:
+                            break
+                        if mb2 > LOW:
+                            probes.append((i2, name2, mb2))
+                    if probes:
+                        probes_sorted = sorted(probes, key=lambda x: abs(x[2] - target))
+                        i, name, mb = probes_sorted[0]
+                        mb_fix, ok2 = finalize_segment(m_in, tensors[i + 1], seg_idx)
+                        if ok2 and LOW <= mb_fix <= HIGH:
+                            prev_idx = i
+                            remaining_mb -= mb_fix
+                            print(f'seg{seg_idx}: {name} = {mb_fix:.2f}MB ✓ (回退)')
+                            log_write(f'Finalize seg{seg_idx}: {name} = {mb_fix:.2f}MB (bt)\n' + '-' * 60 + '\n')
+                            seg_idx += 1
+                            success = True
+                            break
+                k -= 1
+            if success:
+                continue
+            print(f'第{seg_idx}段回退失败，无法提升到>LOW')
+            sys.exit(6)
 
         if pick is None:
-            print(f'第{seg_idx}段无合规候选')
+            # 无合规候选：同样执行“当前段逆向回退并即刻固化”
+            print(f'第{seg_idx}段无合规候选，当前段逆向回退')
+            # 若 probes 非空，使用 probes 最小索引作为当前终点；否则用 prev_idx+1 当作基准
+            cur_end_idx = probes[0][0] if probes else (prev_idx + 1)
+            bt = backtrack_current_and_finalize(prev_idx, cur_end_idx, seg_idx, segments_left, remaining_mb)
+            if bt is not None:
+                i, name, mb_fix = bt
+                prev_idx = i
+                remaining_mb -= mb_fix
+                print(f'seg{seg_idx}: {name} = {mb_fix:.2f}MB ✓ (回退)')
+                log_write(f'Finalize seg{seg_idx}: {name} = {mb_fix:.2f}MB (bt)\n' + '-' * 60 + '\n')
+                seg_idx += 1
+                continue
+            print(f'第{seg_idx}段回退失败，无法找到窗内候选')
             sys.exit(6)
 
         # 固化该段
@@ -254,6 +395,18 @@ def greedy_with_backtrack(model):
         if not (LOW <= mb_fix <= HIGH):
             print('固化后大小异常')
             sys.exit(8)
+
+        # 余均值护栏：若选后剩余平均 < LOW，执行“当前段优先”的逆向回退并即刻固化，然后从下一段继续
+        if SEGMENTS - len(decisions) > 1:
+            avg_rest = (remaining_mb - mb_fix) / (SEGMENTS - len(decisions) - 1)
+            if avg_rest < LOW:
+                print(f'  余均值护栏触发：avg_rest={avg_rest:.2f} < LOW，回退当前段')
+                bt = backtrack_current_and_finalize(prev_idx, i, seg_idx, segments_left, remaining_mb)
+                if bt is not None:
+                    i, name, mb_fix = bt
+                else:
+                    print('  当前段回退失败')
+                
 
         prev_idx = i
         remaining_mb -= mb_fix
