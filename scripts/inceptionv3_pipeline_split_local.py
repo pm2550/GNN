@@ -1060,7 +1060,8 @@ def greedy_with_backtrack(model, model_name, preprocess_fn, input_size_hw):
             cut_from = j_back + 1
             # 删除 seg_fixed 及之后的决策
             del decisions[seg_fixed-1:]
-            _cleanup_after_cut(seg_fixed)
+            # 注意：不要删除刚刚回退固化成功的 seg_fixed 文件，只清理其后的段
+            _cleanup_after_cut(seg_fixed + 1)
             # 记录当前固化
             decisions.append((j_back, mb_back))
             print(f'seg{seg_fixed}: {name_back} = {mb_back:.2f}MB ✓ (无敌回退)')
@@ -1218,9 +1219,12 @@ def greedy_with_backtrack(model, model_name, preprocess_fn, input_size_hw):
     (OUT / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
 
     try:
-        check = chain_inference_check(model, preprocess_fn, (h, w))
+        check = chain_inference_check(model, preprocess_fn, (h, w), samples=1)
         (OUT / 'chain_check.json').write_text(json.dumps(check, indent=2), encoding='utf-8')
-        print(f"chain_check: top1_match={check['top1_match']}/{check['num_samples']}, avg_abs_diff={check['avg_abs_diff']:.6f}")
+        if 'error' in check:
+            print('chain_check error:', check['error'])
+        else:
+            print(f"chain_check: top1_match={check['top1_match']}/{check['num_samples']}, avg_abs_diff={check['avg_abs_diff']:.6f}")
     except Exception as e:
         print('chain_check failed:', e)
 
