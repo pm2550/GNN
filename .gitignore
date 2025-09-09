@@ -1,0 +1,92 @@
+# 忽略所有文件（默认）
+*
+
+# 保留执行脚本和程序文件
+!scripts/
+!scripts/**/*.py
+!scripts/**/*.sh
+
+# 保留文档和配置
+!*.md
+!README*
+!LICENSE*
+!.gitignore
+!.gitattributes
+
+# 保留程序执行结果记录（仅JSON格式的总结文件）
+!**/summary.json
+!results/
+!results/**/*.json
+!results/**/*.md
+!results/**/*.txt
+
+# 保留基准配置
+!baselines/
+!baselines/**
+
+# 忽略所有模型文件和中间产物
+**/*.tflite
+**/*.edgetpu.tflite
+**/*.tflite.gz
+**/*.onnx
+**/*.pb
+**/*.h5
+**/*.pt
+**/*.pth
+**/*.npz
+**/*.npy
+
+# 忽略Python缓存和构建产物
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+
+# 忽略虚拟环境
+.venv/
+venv/
+env/
+.env/
+
+# 忽略编辑器和系统文件
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# 忽略Notebook检查点
+.ipynb_checkpoints/
+
+# 忽略日志文件
+*.log
+nohup.out
+
+# 忽略临时文件和缓存
+tmp/
+temp/
+cache/
+*.tmp
+
+# 忽略大型模型目录（除了summary.json）
+models/
+models_local/
+segment_models/
+
+# 重新包含重要的总结文件
+!models_local/**/summary.json
+!models_local/**/*.md
+
+# 忽略临时Python文件
+scripts/temp_*.py
+
+# 忽略临时和测试文件
+R-GCN.py
+claude2,py
+test.py
+fastdepth_quantized.tflite
+
+# 忽略其他可能的临时文件
+*.tflitt
+*_temp.*
+*_tmp.*

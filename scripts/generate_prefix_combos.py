@@ -140,9 +140,18 @@ def main():
     if not summary_path.exists():
         raise FileNotFoundError(f'summary.json 不存在: {summary_path}')
     summary = json.loads(summary_path.read_text(encoding='utf-8'))
-    cut_names = summary.get('cut_names')
+    # 兼容不同键名：优先 cut_points，其次 cut_names，再次从 decisions 推导
+    cut_names = summary.get('cut_points') or summary.get('cut_names')
+    if (not cut_names) and isinstance(summary.get('decisions'), list):
+        names = []
+        for item in summary['decisions']:
+            if isinstance(item, (list, tuple)) and len(item) >= 1:
+                nm = item[0]
+                if isinstance(nm, str) and nm != 'OUTPUT':
+                    names.append(nm)
+        cut_names = names
     if not cut_names or len(cut_names) != 7:
-        raise ValueError('cut_names 无效或不为 7 个（8 段需要 7 个切点）')
+        raise ValueError('cut_names/cut_points 无效或不为 7 个（8 段需要 7 个切点）')
 
     out_dir = base_dir / (f"combos_K{args.k}_{args.suffix}" if args.suffix else f"combos_K{args.k}")
     ensure_dirs(out_dir)
@@ -152,11 +161,14 @@ def main():
     m = ctor(weights='imagenet', include_top=True)
     segments = build_segments_from_cuts(m, cut_names)
 
-    # 生成前 k-1 段
+    # 生成前 k-1 段（代表性数据：原图经 preprocess，直接喂第一段；第2段起使用中间激活）
     for i in range(args.k - 1):
         s_in, s_out = segments[i]
         sub = tf.keras.Model(s_in, s_out, name=f'seg{i+1}')
-        rep = make_rep_from_input(preprocess_fn, input_hw, samples=32)
+        if i == 0:
+            rep = make_rep_from_input(preprocess_fn, input_hw, samples=32)
+        else:
+            rep = make_rep_from_tensor(m, s_in, preprocess_fn, input_hw, samples=32)
         tfl = tflite_from_concrete(sub, rep)
         tfl_path = tfl_dir / f'seg{i+1}_int8.tflite'
         tfl_path.write_bytes(tfl)

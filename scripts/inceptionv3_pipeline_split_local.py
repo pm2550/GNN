@@ -32,6 +32,8 @@ def _suppress_cpp_io(silence_stdout=True, silence_stderr=True):
 # 提前静音，抑制TF C++ WARNING输出
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
+# 不强制切换到 tf_keras，保持当前已安装的 Keras 版本；量化兼容性由转换路径内部处理
+
 # 禁用 oneDNN 和 XNNPACK 优化，避免 double free 错误
 os.environ['TF_DISABLE_ONEDNN_OPTS'] = '1'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -167,23 +169,66 @@ def chain_inference_check(base_model, preprocess_fn, input_size_hw, samples=5):
         else:
             return {'error':'No segments found','num_samples':samples}
     current = test_batch
+    # 上一段输出的量化参数（scale, zero_point），用于段间重量化
+    prev_q = None
+    def _extract_q(detail):
+        q = detail.get('quantization', None)
+        if q and isinstance(q, tuple) and len(q) == 2 and q[0] not in (None, 0.0):
+            return float(q[0]), int(q[1])
+        qp = detail.get('quantization_parameters', None)
+        if qp:
+            scales = qp.get('scales', []) if isinstance(qp, dict) else []
+            zps = qp.get('zero_points', []) if isinstance(qp, dict) else []
+            if len(scales) >= 1 and len(zps) >= 1:
+                try:
+                    return float(scales[0]), int(zps[0])
+                except Exception:
+                    pass
+        return None
+    def _quantize_from_float(xf, scale, zp):
+        q = np.round(xf / scale + zp).clip(-128, 127).astype(np.int8)
+        return q
+    def _requantize_int8(xq, src_scale, src_zp, dst_scale, dst_zp):
+        xf = (xq.astype(np.float32) - src_zp) * src_scale
+        return _quantize_from_float(xf, dst_scale, dst_zp)
     for p in seg_list:
         intr = tf.lite.Interpreter(model_path=str(p))
         intr.allocate_tensors()
         inp = intr.get_input_details()[0]
         out = intr.get_output_details()[0]
-        # 不做任何动态调整，严格要求shape/dtype一致
+        # 形状严格一致
         if tuple(current.shape) != tuple(inp['shape']):
             return {'error': f'Input shape mismatch for {p.name}: need {tuple(inp["shape"])}, got {tuple(current.shape)}', 'num_samples': samples}
-        if current.dtype != inp['dtype']:
-            try:
-                current = current.astype(inp['dtype'])
-            except Exception:
-                return {'error': f'Input dtype mismatch for {p.name}: need {inp["dtype"]}, got {current.dtype}', 'num_samples': samples}
+        # 段间量化桥接：将上一段输出重量化到本段输入量化域
+        if inp['dtype'] == np.int8:
+            dst_q = _extract_q(inp)
+            if dst_q is None:
+                return {'error': f'Missing quantization for input of {p.name}', 'num_samples': samples}
+            dst_scale, dst_zp = dst_q
+            if current.dtype == np.int8 and prev_q is not None:
+                src_scale, src_zp = prev_q
+                current = _requantize_int8(current, src_scale, src_zp, dst_scale, dst_zp)
+            elif current.dtype != np.int8:
+                # 从浮点量化到本段输入域
+                current = _quantize_from_float(current.astype(np.float32), dst_scale, dst_zp)
+        else:
+            # 浮点输入：如需，转换为期望dtype
+            if current.dtype != inp['dtype']:
+                try:
+                    current = current.astype(inp['dtype'])
+                except Exception:
+                    return {'error': f'Input dtype mismatch for {p.name}: need {inp["dtype"]}, got {current.dtype}', 'num_samples': samples}
         intr.set_tensor(inp['index'], current)
         intr.invoke()
         current = intr.get_tensor(out['index'])
-    segmented_outputs = current
+        # 记录本段输出量化，供下一段桥接
+        prev_q = _extract_q(out)
+    # 将最后一段输出去量化为 float，以便公平比较
+    if prev_q is not None and current.dtype == np.int8:
+        last_scale, last_zp = prev_q
+        segmented_outputs = (current.astype(np.float32) - last_zp) * last_scale
+    else:
+        segmented_outputs = current
     if original_outputs.shape != segmented_outputs.shape:
         return {'error': f'Shape mismatch: original {original_outputs.shape} vs segmented {segmented_outputs.shape}', 'num_samples': samples}
     original_top1 = np.argmax(original_outputs, axis=1)
@@ -329,7 +374,7 @@ def expected_in_channels(model_sub):
     """获取模型期望的输入通道数"""
     return model_sub.input.shape[-1] if len(model_sub.input.shape) >= 4 else None
 
-def convert_with_auto_channel_guard(model_sub, rep_fn):
+def convert_with_auto_channel_guard(model_sub, rep_fn, allow_relaxed_ops: bool = False):
     """带自动通道守护的TFLite转换"""
     exp_c = expected_in_channels(model_sub)
     import contextlib, io, sys
@@ -337,21 +382,39 @@ def convert_with_auto_channel_guard(model_sub, rep_fn):
 
     def _build_converter_by(method: str, legacy_flag: bool):
         # method: 'concrete' | 'saved' | 'keras'
+        input_shape = tuple(int(x) if x is not None else 1 for x in model_sub.input.shape)
+
         if method == 'concrete':
-            # 与 _build_converter_from_cf 的方法1一致
-            input_shape = tuple(int(x) if x is not None else 1 for x in model_sub.input.shape)
-            fn = tf.function(model_sub, autograph=False)
-            concrete_func = fn.get_concrete_function(tf.TensorSpec(input_shape, dtype=tf.float32))
-            conv = tf.lite.TFLiteConverter.from_concrete_functions([concrete_func], trackable_obj=model_sub)
+            # 使用纯 tf.function 包装，避免依赖 Keras3 的内部保存机制
+            @tf.function(input_signature=[tf.TensorSpec(input_shape, dtype=tf.float32)])
+            def _serve(x):
+                return model_sub(x)
+
+            concrete_func = _serve.get_concrete_function()
+            # 关键：不传 trackable_obj，绕过 Keras3 _get_save_spec 路径
+            conv = tf.lite.TFLiteConverter.from_concrete_functions([concrete_func])
+
         elif method == 'saved':
+            # 通过 tf.Module 封装并导出 SavedModel，避免直接保存 Keras Functional
             import tempfile
+
+            class _Wrapped(tf.Module):
+                def __init__(self, wrapped_model):
+                    super().__init__()
+                    self._m = wrapped_model
+
+                @tf.function(input_signature=[tf.TensorSpec(input_shape, dtype=tf.float32)])
+                def __call__(self, x):
+                    return self._m(x)
+
             with tempfile.TemporaryDirectory() as temp_dir:
-                if hasattr(model_sub, 'export'):
-                    model_sub.export(temp_dir)
-                else:
-                    model_sub.save(temp_dir)
+                wrapped = _Wrapped(model_sub)
+                sig = wrapped.__call__.get_concrete_function()
+                tf.saved_model.save(wrapped, temp_dir, signatures={tf.saved_model.DEFAULT_SERVING_SIGNATURE_DEF_KEY: sig})
                 conv = tf.lite.TFLiteConverter.from_saved_model(temp_dir)
+
         elif method == 'keras':
+            # 作为最后兜底路径（在部分环境仍可用）
             conv = tf.lite.TFLiteConverter.from_keras_model(model_sub)
         else:
             raise ValueError('unknown method')
@@ -377,8 +440,15 @@ def convert_with_auto_channel_guard(model_sub, rep_fn):
             warnings.simplefilter('ignore')
             with contextlib.redirect_stderr(buf):
                 with _suppress_cpp_io(True, True):
-                    # 依次尝试 concrete → saved → keras，若 convert() 抛出 _get_save_spec 或其他异常则自动换路
-                    methods = ['concrete', 'saved', 'keras']
+                    # 为 Xception 优先走 saved（tf.Module 包装）→ concrete，避免直接走 keras 路径
+                    try:
+                        model_name = MODEL_NAME
+                    except Exception:
+                        model_name = None
+                    if model_name == 'Xception':
+                        methods = ['saved', 'concrete']
+                    else:
+                        methods = ['concrete', 'saved', 'keras']
                     last_err = None
                     for m in methods:
                         try:
@@ -387,7 +457,19 @@ def convert_with_auto_channel_guard(model_sub, rep_fn):
                             break
                         except Exception as e:
                             last_err = e
-                            # 针对 _get_save_spec 直接尝试下一路
+                            # 针对 _get_save_spec 或量化失败：如果允许放宽（仅用于探测），尝试松绑 ops 集合
+                            if allow_relaxed_ops:
+                                try:
+                                    conv = _build_converter_by(m, legacy_flag)
+                                    conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS, tf.lite.OpsSet.SELECT_TF_OPS]
+                                    # 放弃强制 int8 I/O，仅用于估算大小
+                                    conv.inference_input_type = tf.float32
+                                    conv.inference_output_type = tf.float32
+                                    tfl = conv.convert()
+                                    break
+                                except Exception as e_relaxed:
+                                    last_err = e_relaxed
+                                    continue
                             continue
                     else:
                         raise last_err if last_err is not None else RuntimeError('convert failed')
@@ -514,7 +596,9 @@ def probe_size(base_model, m_in, t_out, name_tag, h, w, preprocess_fn):
         return PROBE_CACHE[key]
     try:
         sub = tf.keras.Model(m_in, t_out)
-        rep_fn = make_rep_from_prev(base_model, m_in, N=16, h=h, w=w, preprocess_fn=preprocess_fn)
+        # Xception 探测期收敛更慢，降采样代表集规模以避免卡顿
+        N_probe = 8 if (MODEL_NAME == 'Xception') else 16
+        rep_fn = make_rep_from_prev(base_model, m_in, N=N_probe, h=h, w=w, preprocess_fn=preprocess_fn)
         tfl, _ = convert_with_auto_channel_guard(sub, rep_fn)
         tfl_mb = len(tfl) / 1024 / 1024
         if tfl_mb > 6.0:
@@ -794,6 +878,20 @@ def greedy_with_backtrack(model, model_name, preprocess_fn, input_size_hw):
             if (model_name == 'InceptionV3') and (segments_left > 1):
                 if not (name.startswith('mixed') and ('_' not in name)):
                     continue
+            # Xception：按 legacy 规则限制候选
+            if model_name == 'Xception' and (segments_left > 1):
+                layer_i = cands[i]
+                is_pool = isinstance(layer_i, (tf.keras.layers.MaxPooling2D, tf.keras.layers.AveragePooling2D)) or name == 'avg_pool'
+                is_add = isinstance(layer_i, tf.keras.layers.Add)
+                is_block14_act = name.startswith('block14_') and name.endswith('_act')
+                if seg_idx >= 5:
+                    # 段>=5：禁用所有池化，仅允许 Add 与 block14_*_act
+                    if not (is_add or is_block14_act):
+                        continue
+                else:
+                    # 段<5：仅允许 Add 与 Pool（收敛更稳），其余跳过
+                    if not (is_add or is_pool):
+                        continue
             _flush_print(f'  探测: seg{seg_idx} -> {name}')
             t_out = tensors[i + 1]
             mb = probe_size(model, m_in, t_out, f'seg{seg_idx}_{name}', h, w, preprocess_fn)
@@ -1011,9 +1109,16 @@ def greedy_with_backtrack(model, model_name, preprocess_fn, input_size_hw):
                             is_top_mixed = name_j.startswith('mixed') and ('_' not in name_j)
                             if not is_top_mixed:
                                 continue
-                        if model_name == 'Xception' and (cur_seg >= 5):
-                            if isinstance(l_j, (tf.keras.layers.MaxPooling2D, tf.keras.layers.AveragePooling2D)) or name_j == 'avg_pool':
-                                continue
+                        if model_name == 'Xception':
+                            is_pool_bt = isinstance(l_j, (tf.keras.layers.MaxPooling2D, tf.keras.layers.AveragePooling2D)) or name_j == 'avg_pool'
+                            is_add_bt = isinstance(l_j, tf.keras.layers.Add)
+                            is_block14_act_bt = name_j.startswith('block14_') and name_j.endswith('_act')
+                            if cur_seg >= 5:
+                                if not (is_add_bt or is_block14_act_bt):
+                                    continue
+                            else:
+                                if not (is_add_bt or is_pool_bt):
+                                    continue
                         mb_est = _estimate_tflite_size_mb(model, m_in_cur, tensors[j + 1], f'bt_seg{cur_seg}_{name_j}', h, w, preprocess_fn)
                         if mb_est is None:
                             continue
@@ -1206,13 +1311,31 @@ def greedy_with_backtrack(model, model_name, preprocess_fn, input_size_hw):
         print(f'  {f.name}: {mb:.2f}MB {"✓" if ok else "✗"}')
     print(f'✓ {ok_cnt}/{len(tpu_files)} 段合规')
     
+    # 规整 cut_points：去重且仅保留前 SEGMENTS-1 个切点
+    _seen_cp = set()
+    _ordered_unique = []
+    for _nm in cut_layer_names:
+        if _nm == 'OUTPUT':
+            continue
+        if _nm in _seen_cp:
+            continue
+        _seen_cp.add(_nm)
+        _ordered_unique.append(_nm)
+    cut_points_out = _ordered_unique[: max(0, SEGMENTS - 1)]
+
+    # 将 decisions 映射为 (名称, 大小)，名称按 cut_points_out 对齐，最后一段为 OUTPUT
+    decisions_named = []
+    for _idx, (_raw_idx, _mb) in enumerate(decisions):
+        _nm = cut_points_out[_idx] if _idx < len(cut_points_out) else 'OUTPUT'
+        decisions_named.append((_nm, _mb))
+
     summary = {
         'model_name': model_name,
         'segments': SEGMENTS,
         'size_range': [LOW, HIGH],
         'total_mb': full_mb,
-        'cut_points': cut_layer_names,
-        'decisions': [(name if isinstance(idx, str) else cands[idx].name, mb) for (idx, mb) in decisions],
+        'cut_points': cut_points_out,
+        'decisions': decisions_named,
         'compliant_segments': ok_cnt,
         'total_segments': len(tpu_files)
     }
