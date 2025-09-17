@@ -110,6 +110,16 @@ def pick_candidates(model, model_name):
                     ok = True
                 else:
                     ok = False
+            elif model_name == 'MobileNetV2':
+                # MobileNetV2：优先使用 block_*_add / block_*_project_BN 和 out_relu
+                if re.match(r'^block_\d+_add$', layer_name):
+                    ok = True
+                elif re.match(r'^block_\d+_project_BN$', layer_name):
+                    ok = True
+                elif layer_name in ['out_relu', 'global_average_pooling2d', 'Logits', 'predictions']:
+                    ok = True
+                else:
+                    ok = False
             else:
                 # 其它模型：Merge/Pool/Activation/BatchNorm等作一般候选（保持原策略，但去重）
                 if any(k in layer_type for k in ['Pool','Pooling']):
@@ -1369,7 +1379,8 @@ def main():
     parser.add_argument('--segments', type=int, default=SEGMENTS)
     parser.add_argument('--low', type=float, default=LOW)
     parser.add_argument('--high', type=float, default=HIGH)
-    parser.add_argument('--model', type=str, choices=['InceptionV3', 'ResNet101', 'ResNet50', 'DenseNet201', 'Xception'], required=True)
+    parser.add_argument('--model', type=str, choices=['InceptionV3', 'ResNet101', 'ResNet50', 'DenseNet201', 'Xception', 'MobileNetV2'], required=True)
+    parser.add_argument('--alpha', type=float, default=1.0, help='Width multiplier for MobileNetV2 (ignored for others)')
     
     args = parser.parse_args()
     SEGMENTS = args.segments
@@ -1383,7 +1394,8 @@ def main():
         'ResNet101': tf.keras.applications.ResNet101,
         'ResNet50': tf.keras.applications.ResNet50,
         'DenseNet201': tf.keras.applications.DenseNet201,
-        'Xception': tf.keras.applications.Xception
+        'Xception': tf.keras.applications.Xception,
+        'MobileNetV2': tf.keras.applications.MobileNetV2
     }
     
     preprocess_fns = {
@@ -1391,7 +1403,8 @@ def main():
         'ResNet101': tf.keras.applications.resnet.preprocess_input,
         'ResNet50': tf.keras.applications.resnet.preprocess_input,
         'DenseNet201': tf.keras.applications.densenet.preprocess_input,
-        'Xception': tf.keras.applications.xception.preprocess_input
+        'Xception': tf.keras.applications.xception.preprocess_input,
+        'MobileNetV2': tf.keras.applications.mobilenet_v2.preprocess_input
     }
     
     input_sizes = {
@@ -1399,7 +1412,8 @@ def main():
         'ResNet101': (224, 224),
         'ResNet50': (224, 224),
         'DenseNet201': (224, 224),
-        'Xception': (299, 299)
+        'Xception': (299, 299),
+        'MobileNetV2': (224, 224)
     }
     
     ctor = constructors[MODEL_NAME]
@@ -1416,7 +1430,13 @@ def main():
     LOG = OUT / 'compilation_log.txt'
 
     print(f'=== PIPELINE split {MODEL_NAME}: segments={SEGMENTS} S=[{LOW},{HIGH}] ===')
-    m = ctor(weights='imagenet', include_top=True)
+    if MODEL_NAME == 'MobileNetV2':
+        alpha = args.alpha
+        # 预训练权重仅支持 alpha<=1.0；alpha>1.0 使用随机初始化
+        weights = 'imagenet' if alpha <= 1.0 else None
+        m = tf.keras.applications.MobileNetV2(input_shape=(224,224,3), alpha=alpha, include_top=True, weights=weights)
+    else:
+        m = ctor(weights='imagenet', include_top=True)
     greedy_with_backtrack(m, MODEL_NAME, preprocess_fn, (h, w))
 
 
