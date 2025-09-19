@@ -84,61 +84,6 @@ def sanitize_log_lines(s: str) -> str:
 def sanitize_log(s: str) -> str:
     return re.sub(r'[^\x20-\x7E]', '?', s)
 
-# 替换 PROBE_CACHE 键为稳定名称
-# 代表性：在使用处直接构造稳定键
-
-# pick_candidates 去重
-def pick_candidates(model, model_name):
-    candidates = []
-    seen = set()
-    for layer in model.layers:
-        try:
-            # 跳过输入层
-            if type(layer).__name__ in ['InputLayer']:
-                continue
-            if id(layer) in seen:
-                continue
-            layer_name = layer.name
-            layer_type = type(layer).__name__
-
-            ok = False
-            if model_name == 'InceptionV3':
-                # InceptionV3：非最后段仅允许顶层 mixed* 作为切点；avg_pool 仅留给最后一段
-                if layer_name.startswith('mixed'):
-                    ok = True
-                elif layer_name in ['avg_pool', 'global_average_pooling2d']:
-                    ok = True
-                else:
-                    ok = False
-            elif model_name == 'MobileNetV2':
-                # MobileNetV2：优先使用 block_*_add / block_*_project_BN 和 out_relu
-                if re.match(r'^block_\d+_add$', layer_name):
-                    ok = True
-                elif re.match(r'^block_\d+_project_BN$', layer_name):
-                    ok = True
-                elif layer_name in ['out_relu', 'global_average_pooling2d', 'Logits', 'predictions']:
-                    ok = True
-                else:
-                    ok = False
-            else:
-                # 其它模型：Merge/Pool/Activation/BatchNorm等作一般候选（保持原策略，但去重）
-                if any(k in layer_type for k in ['Pool','Pooling']):
-                    ok = True
-                elif layer_type in ['Add','Concatenate','Multiply','Average','Maximum','Minimum']:
-                    ok = True
-                else:
-                    # 具有 3D/4D 输出的特征图也可考虑
-                    if hasattr(layer, 'output') and getattr(layer, 'output', None) is not None:
-                        shp = getattr(layer.output, 'shape', None)
-                        if shp is not None and len(shp) >= 3:
-                            ok = True
-            if ok:
-                candidates.append(layer)
-                seen.add(id(layer))
-        except Exception:
-            continue
-    print(f'找到 {len(candidates)} 个候选切点')
-    return candidates
 
 # chain_inference_check 优先CPU TFLite，再备选TPU
 def chain_inference_check(base_model, preprocess_fn, input_size_hw, samples=5):

@@ -117,10 +117,10 @@ def main():
     args = parser.parse_args()
 
     m = tf.keras.applications.InceptionV3(weights='imagenet', include_top=True)
-    # 动态读取切点（若失败则回退到默认）
+    # 动态读取切点，严格要求从 full-split 的 summary.json 获取；缺失则报错
     cut_names = load_cut_names_from_summary(BASE)
-    if not cut_names:
-        cut_names = ['mixed3', 'mixed5', 'mixed6', 'mixed7', 'mixed8', 'mixed9', 'mixed10']
+    if not cut_names or len(cut_names) != 7:
+        raise RuntimeError('未能从 full_split_pipeline_local/summary.json 获取到 7 个切点（cut_points/decisions）')
     segments = build_segments(m, cut_names)
 
     k = args.k
@@ -151,7 +151,7 @@ def main():
     meta = {
         'created_at': datetime.now().isoformat(),
         'k': k,
-        'cut_names': CUT_NAMES,
+        'cut_names': cut_names,
         'scheme': 'prefix + merged tail',
     }
     (out_dir / 'meta.json').write_text(json.dumps(meta, indent=2), encoding='utf-8')
